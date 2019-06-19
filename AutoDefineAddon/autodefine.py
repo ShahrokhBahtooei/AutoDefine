@@ -173,7 +173,7 @@ def get_preferred_valid_entries(editor, word):
     if not entries.valid:
         potential = " Potential matches: " + ", ".join(potential_unified)
         tooltip("No entry found in Merriam-Webster dictionary for word '%s'.%s" %
-                (word, potential if entries.potential else ""))
+                (word, potential if potential_unified else ""))
         _focus_zero_field(editor)
     return entries.valid
 
