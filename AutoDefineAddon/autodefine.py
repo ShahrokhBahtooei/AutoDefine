@@ -153,22 +153,20 @@ def get_preferred_valid_entries(editor, word):
                      urllib.parse.quote_plus(word) + "?key=" + MERRIAM_WEBSTER_API_KEY
     medical_url = "https://www.dictionaryapi.com/api/references/medical/v2/xml/" + \
                   urllib.parse.quote_plus(word) + "?key=" + MERRIAM_WEBSTER_MEDICAL_API_KEY
+
     all_collegiate_entries = get_entries_from_api(word, collegiate_url)
     all_medical_entries = get_entries_from_api(word, medical_url)
 
+    websters_entries = [all_collegiate_entries, all_medical_entries]
+    if PREFERRED_DICTIONARY != "COLLEGIATE":
+        websters_entries.reverse()
+
     potential_unified = set()
-    if PREFERRED_DICTIONARY == "COLLEGIATE":
-        entries = filter_entries_lower_and_potential(word, all_collegiate_entries)
+    for dic_entries in websters_entries:
+        entries = filter_entries_lower_and_potential(word, dic_entries)
         potential_unified |= entries.potential
-        if not entries.valid:
-            entries = filter_entries_lower_and_potential(word, all_medical_entries)
-            potential_unified |= entries.potential
-    else:
-        entries = filter_entries_lower_and_potential(word, all_medical_entries)
-        potential_unified |= entries.potential
-        if not entries.valid:
-            entries = filter_entries_lower_and_potential(word, all_collegiate_entries)
-            potential_unified |= entries.potential
+        if entries.valid:
+            break
 
     if not entries.valid:
         potential = " Potential matches: " + ", ".join(potential_unified)
