@@ -60,9 +60,6 @@ PRONOUNCE_ONLY_SHORTCUT = ""
 
 PHONETIC_TRANSCRIPTION_ONLY_SHORTCUT = ""
 
-PART_OF_SPEECH_ABBREVIATION = {"verb": "v.", "noun": "n.", "adverb": "adv.", "adjective": "adj."}
-
-
 # Collegiate Dictionary API XML documentation: http://goo.gl/LuD83A
 # Medical Dictionary API XML documentation: https://goo.gl/akvkbB
 #
@@ -96,7 +93,11 @@ def get_definition(editor,
                    force_pronounce=False,
                    force_definition=False,
                    force_phonetic_transcription=False):
-    editor.saveNow(lambda: _get_definition(editor, force_pronounce, force_definition, force_phonetic_transcription))
+
+    editor.saveNow(lambda: _get_definition(editor,
+                                           force_pronounce,
+                                           force_definition,
+                                           force_phonetic_transcription))
 
 
 def get_definition_force_pronunciation(editor):
@@ -114,7 +115,7 @@ def get_definition_force_phonetic_transcription(editor):
 def validate_settings():
     # ideally, we wouldn't have to force people to individually register, but the API limit is just 1000 calls/day.
 
-    if PREFERRED_DICTIONARY != "COLLEGIATE" and PREFERRED_DICTIONARY != "MEDICAL":
+    if PREFERRED_DICTIONARY not in ("COLLEGIATE", "MEDICAL"):
         message = "Setting PREFERRED_DICTIONARY must be set to either COLLEGIATE or MEDICAL. Current setting: '%s'" \
                   % PREFERRED_DICTIONARY
         showInfo(message)
@@ -148,44 +149,42 @@ def _focus_zero_field(editor):
         editor.web.eval("focusField(%d);" % 0)
 
 
-def get_preferred_valid_entries(editor, word):
+def _get_preferred_valid_and_potential_entries(word):
+    potential_entries = []
+    entries = None
+    for dic_entries in _obtain_related_entries_from_first_unchecked_dic(word):
+        entries = filter_entries_lower_and_potential(word, dic_entries)
+        potential_entries.extend(entries.potential)
+        if entries.valid:
+            break
+
+    return entries.valid, potential_entries
+
+
+def _obtain_related_entries_from_first_unchecked_dic(word):
     collegiate_url = "http://www.dictionaryapi.com/api/v1/references/collegiate/xml/" + \
                      urllib.parse.quote_plus(word) + "?key=" + MERRIAM_WEBSTER_API_KEY
     medical_url = "https://www.dictionaryapi.com/api/references/medical/v2/xml/" + \
                   urllib.parse.quote_plus(word) + "?key=" + MERRIAM_WEBSTER_MEDICAL_API_KEY
-    all_collegiate_entries = get_entries_from_api(word, collegiate_url)
-    all_medical_entries = get_entries_from_api(word, medical_url)
 
-    potential_unified = set()
-    if PREFERRED_DICTIONARY == "COLLEGIATE":
-        entries = filter_entries_lower_and_potential(word, all_collegiate_entries)
-        potential_unified |= entries.potential
-        if not entries.valid:
-            entries = filter_entries_lower_and_potential(word, all_medical_entries)
-            potential_unified |= entries.potential
-    else:
-        entries = filter_entries_lower_and_potential(word, all_medical_entries)
-        potential_unified |= entries.potential
-        if not entries.valid:
-            entries = filter_entries_lower_and_potential(word, all_collegiate_entries)
-            potential_unified |= entries.potential
+    urls = [collegiate_url, medical_url]
 
-    if not entries.valid:
-        potential = " Potential matches: " + ", ".join(potential_unified)
-        tooltip("No entry found in Merriam-Webster dictionary for word '%s'.%s" %
-                (word, potential if entries.potential else ""))
-        _focus_zero_field(editor)
-    return entries.valid
+    if PREFERRED_DICTIONARY != "COLLEGIATE":
+        urls.reverse()
+
+    for url in urls:
+        yield get_entries_from_api(word, url)
 
 
 def filter_entries_lower_and_potential(word, all_entries):
     valid_entries = extract_valid_entries(word, all_entries)
-    maybe_entries = set()
+    maybe_entries = []
     if not valid_entries:
         valid_entries = extract_valid_entries(word, all_entries, True)
         if not valid_entries:
             for entry in all_entries:
-                maybe_entries.add(re.sub(r'\[\d+\]$', "", entry.attrib["id"]))
+                maybe_entries.append(entry)
+
     return ValidAndPotentialEntries(valid_entries, maybe_entries)
 
 
@@ -200,12 +199,14 @@ def extract_valid_entries(word, all_entries, lower=False):
             if entry.attrib["id"][:len(word) + 1] == word + "[" \
                     or entry.attrib["id"] == word:
                 valid_entries.append(entry)
+
     return valid_entries
 
 
 def get_entries_from_api(word, url):
     if "YOUR_KEY_HERE" in url:
         return []
+
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:62.0)'
                                                                  ' Gecko/20100101 Firefox/62.0'})
@@ -215,12 +216,16 @@ def get_entries_from_api(word, url):
                      "A web browser with the web page that lists your keys will open." % url.split("?key=")[1])
             webbrowser.open("https://www.dictionaryapi.com/account/my-keys.htm")
             return []
+
         if "Results not found" in returned.decode("UTF-8"):
             return []
+
         etree = ET.fromstring(returned)
         return etree.findall("entry")
+
     except URLError:
         return []
+
     except (ET.ParseError, RemoteDisconnected):
         showInfo("Couldn't parse API response for word '%s'. "
                  "Please submit an issue to the AutoDefine GitHub (a web browser window will open)." % word)
@@ -248,80 +253,190 @@ def _get_definition(editor,
                     force_pronounce=False,
                     force_definition=False,
                     force_phonetic_transcription=False):
-    validate_settings()
-    word = _get_word(editor)
-    if word == "":
-        tooltip("AutoDefine: No text found in note fields.")
-        return
-    valid_entries = get_preferred_valid_entries(editor, word)
 
-    insert_queue = {}
+    cp = CommandProvider(editor)
+    cp.run_commands(force_definition, force_phonetic_transcription, force_pronounce)
 
-    # Add Vocal Pronunciation
-    if (not force_definition and not force_phonetic_transcription and PRONUNCIATION_FIELD > -1) or force_pronounce:
+
+class CommandProvider:
+    def __init__(self, editor):
+        self.editor = editor
+        self._word = _get_word(editor)
+        self._valid_entries = []
+        self._insert_queue = InsertQueue()
+        self._valid_undefined_entries = []
+        self._info_not_found = []
+
+    def run_commands(self, force_definition, force_phonetic_transcription, force_pronounce):
+        validate_settings()  # TODO Check for continuing do()
+
+        if self._word == "":
+            tooltip("AutoDefine: No text found in note fields.")
+            return
+
+        self._valid_entries, potential_entries = _get_preferred_valid_and_potential_entries(self._word)
+
+        if not self._valid_entries:
+            self._derive_valid_undefined_entries_if_exist(potential_entries)
+
+            if not self._valid_undefined_entries:
+                self._announce_no_entry_and_suggest_potentials(potential_entries)
+
+                _focus_zero_field(self.editor)
+                return
+
+        for command in self._determine_commands(force_definition,
+                                                force_phonetic_transcription,
+                                                force_pronounce):
+            command()
+
+        self._insert_queue.transfer_to_fields(self.editor)
+
+        self._announce_unavailable_info_if_exists()
+
+        self._search_google_images_for_the_word_via_os_browser_if_needed()
+
+        _focus_zero_field(self.editor)
+
+    def _derive_valid_undefined_entries_if_exist(self, potential_entries):
+        for potential in potential_entries:
+            for derivative_element in potential.findall("uro"):
+                spelling_element = derivative_element.find("ure")
+                if spelling_element.text.replace("*", "").casefold() == self._word.casefold():
+                    root = potential.attrib["id"]
+                    self._save_root_in_entry(derivative_element, root)
+                    self._valid_undefined_entries.append(derivative_element)
+
+    @staticmethod
+    def _save_root_in_entry(entry, root):
+        entry.tail = root
+
+    def _announce_no_entry_and_suggest_potentials(self, potential_entries):
+        potentials = list(dict.fromkeys(
+            self._remove_indexing_number_at_the_end(potential.attrib["id"])
+            for potential in potential_entries
+        ))
+
+        msg = f"No entry found in Merriam-Webster dictionary for word '{self._word}'."
+        if potentials:
+            msg += f" Potential matches: <b>{'</b>, <b>'.join(potentials)}</b>"
+
+        tooltip(msg)
+
+    @staticmethod
+    def _remove_indexing_number_at_the_end(word):
+        # re: Remove numbers formatted like [2], [13], etc., from the end of the suggested word
+        return re.sub(r'\[\d+\]$', "", word)
+
+    def _determine_commands(self, force_definition, force_phonetic_transcription, force_pronounce):
+        if force_pronounce:
+            yield self._add_vocal_pronunciation
+
+        elif force_phonetic_transcription:
+            yield self._add_phonetic_transcription
+
+        elif force_definition:
+            yield self._add_definition
+
+        else:
+            if PRONUNCIATION_FIELD > -1:
+                yield self._add_vocal_pronunciation
+
+            if PHONETIC_TRANSCRIPTION_FIELD > -1:
+                yield self._add_phonetic_transcription
+
+            if DEFINITION_FIELD > -1:
+                yield self._add_definition
+
+    def _add_vocal_pronunciation(self):
         # Parse all unique pronunciations, and convert them to URLs as per http://goo.gl/nL0vte
         all_sounds = []
-        for entry in valid_entries:
+        for entry in self._valid_entries + self._valid_undefined_entries:
             for wav in entry.findall("sound/wav"):
-                raw_wav = wav.text
-                # API-specific URL conversions
-                if raw_wav[:3] == "bix":
-                    mid_url = "bix"
-                elif raw_wav[:2] == "gg":
-                    mid_url = "gg"
-                elif raw_wav[:1].isdigit():
-                    mid_url = "number"
-                else:
-                    mid_url = raw_wav[:1]
-                wav_url = "http://media.merriam-webster.com/soundc11/" + mid_url + "/" + raw_wav
-                all_sounds.append(editor.urlToFile(wav_url).strip())
+                all_sounds.append(self._download_sound(wav.text))
 
-        # We want to make this a non-duplicate list, so that we only get unique sound files.
+        if all_sounds:
+            to_print = self._prepare_sound_names_to_print(all_sounds)
+            self._insert_queue.add(to_print, self._get_final_sound_index())
+        else:
+            self._info_not_found.append("pronunciation")
+
+    def _download_sound(self, raw_wav):
+        # API-specific URL conversions
+        if raw_wav[:3] == "bix":
+            mid_url = "bix"
+
+        elif raw_wav[:2] == "gg":
+            mid_url = "gg"
+
+        elif raw_wav[:1].isdigit():
+            mid_url = "number"
+
+        else:
+            mid_url = raw_wav[:1]
+
+        wav_url = "http://media.merriam-webster.com/soundc11/" + mid_url + "/" + raw_wav
+        return self.editor.urlToFile(wav_url).strip()
+
+    @staticmethod
+    def _prepare_sound_names_to_print(all_sounds):
+        # We want to make this a non-duplicate list so that we only get unique sound files.
         all_sounds = list(dict.fromkeys(all_sounds))
+        to_print = ""
+        for sound_local_filename in all_sounds:
+            to_print += f"[sound:{sound_local_filename}]"
 
+        return to_print
+
+    def _get_final_sound_index(self):
         final_pronounce_index = PRONUNCIATION_FIELD
-        fields = mw.col.models.fieldNames(editor.note.model())
+        fields = mw.col.models.fieldNames(self.editor.note.model())
         for field in fields:
             if '🔊' in field:
                 final_pronounce_index = fields.index(field)
                 break
 
-        to_print = ""
-        for sound_local_filename in all_sounds:
-            to_print += f'[sound:{sound_local_filename}]'
+        return final_pronounce_index
 
-        _add_to_insert_queue(insert_queue, to_print, final_pronounce_index)
-
-    # Add Phonetic Transcription
-    if (not force_definition and not force_pronounce and PHONETIC_TRANSCRIPTION_FIELD > -1) or \
-            force_phonetic_transcription:
-
-        # extract phonetic transcriptions for each entry and label them by part of speech
+    def _add_phonetic_transcription(self):
         all_transcriptions = []
-        for entry in valid_entries:
+        for entry in self._valid_entries + self._valid_undefined_entries:
             if entry.find("pr") is not None:
                 phonetic_transcription = entry.find("pr").text
+                part_of_speech = self._abbreviate_part_of_speech(entry.find("fl").text)
 
-                part_of_speech = entry.find("fl").text
-                part_of_speech = _abbreviate_part_of_speech(part_of_speech)
-
-                row = f'<b>{part_of_speech}</b> \\{phonetic_transcription}\\'
+                row = f"<b>{part_of_speech}</b> \\{phonetic_transcription}\\"
                 all_transcriptions.append(row)
 
-        to_print = "<br>".join(all_transcriptions)
+        if all_transcriptions:
+            to_print = "<br>".join(all_transcriptions)
+            self._insert_queue.add(to_print, PHONETIC_TRANSCRIPTION_FIELD)
+        else:
+            self._info_not_found.append("phonetic transcription")  # TODO: Consider good-bye
 
-        _add_to_insert_queue(insert_queue, to_print, PHONETIC_TRANSCRIPTION_FIELD)
+    part_of_speech_abbreviation = {
+        "verb": "v.",
+        "noun": "n.",
+        "adverb": "adv.",
+        "adjective": "adj."}
 
-    # Add Definition
-    definition_array = []
-    if (not force_pronounce and not force_phonetic_transcription and DEFINITION_FIELD > -1) or force_definition:
+    @classmethod
+    def _abbreviate_part_of_speech(cls, part_of_speech):
+        return cls.part_of_speech_abbreviation.get(part_of_speech, part_of_speech)
+
+    def _add_definition(self):
+        if self._valid_undefined_entries:
+            self._info_not_found.append("definition")
+            return
+
+        definition_array = []
         # Extract the type of word this is
-        for entry in valid_entries:
+        for entry in self._valid_entries:
             this_def = entry.find("def")
             if entry.find("fl") is None:
                 continue
             fl = entry.find("fl").text
-            fl = _abbreviate_part_of_speech(fl)
+            fl = self._abbreviate_part_of_speech(fl)
 
             this_def.tail = "<b>" + fl + "</b>"  # save the functional label (noun/verb/etc) in the tail
 
@@ -390,30 +505,64 @@ def _get_definition(editor,
         # final cleanup of <sx> tag bs
         to_return = to_return.replace(".</b> ; ", ".</b> ")  # <sx> as first definition after "n. " or "v. "
         to_return = to_return.replace("\n; ", "\n")  # <sx> as first definition after newline
-        _add_to_insert_queue(insert_queue, to_return, DEFINITION_FIELD)
+        self._insert_queue.add(to_return, DEFINITION_FIELD)
 
-    # Insert each queue into the considered field
-    for field_index in insert_queue.keys():
-        insert_into_field(editor, insert_queue[field_index], field_index)
+    def _announce_unavailable_info_if_exists(self):
+        if not self._info_not_found:
+            return
 
-    if OPEN_IMAGES_IN_BROWSER:
-        webbrowser.open("https://www.google.com/search?q= " + word + "&safe=off&tbm=isch&tbs=isz:lt,islt:xga", 0, False)
+        if len(self._info_not_found) == 1:
+            msg = f"No <b>{self._info_not_found[0]}</b>"
 
-    _focus_zero_field(editor)
+        elif len(self._info_not_found) == 2:
+            msg = f"Neither of the <b>{'</b> and <b>'.join(self._info_not_found)}</b>"
+
+        else:
+            msg = f"""None of the <b>{self._info_not_found[0]}</b>,
+            <b>{self._info_not_found[1]}</b>, and <b>{self._info_not_found[2]}</b>"""
+
+        msg += f" found for entry '{self._word}'."
+
+        msg += self._print_roots_if_exist()
+
+        tooltip(msg)
+
+    def _print_roots_if_exist(self):
+        if not self._valid_undefined_entries:
+            return ""
+
+        roots = []
+        for entry in self._valid_undefined_entries:
+            root = self._derive_saved_root_in_entry(entry)
+            roots.append(self._remove_indexing_number_at_the_end(root))
+
+        roots = list(dict.fromkeys(roots))
+
+        return f" Root word: <b>{'</b>, <b>'.join(roots)}</b>"
+
+    @staticmethod
+    def _derive_saved_root_in_entry(entry):
+        return entry.tail
+
+    def _search_google_images_for_the_word_via_os_browser_if_needed(self):
+        if OPEN_IMAGES_IN_BROWSER:
+            webbrowser.open("https://www.google.com/search?q= " + self._word +
+                            "&safe=off&tbm=isch&tbs=isz:lt,islt:xga", 0, False)
 
 
-def _add_to_insert_queue(insert_queue, to_print, field_index):
-    if field_index not in insert_queue.keys():
-        insert_queue[field_index] = to_print
-    else:
-        insert_queue[field_index] += "<br>" + to_print
+class InsertQueue:
+    def __init__(self):
+        self._queue = {}
 
+    def add(self, to_print, field_id):
+        if field_id not in self._queue:
+            self._queue[field_id] = to_print
+        else:
+            self._queue[field_id] += "<br>" + to_print
 
-def _abbreviate_part_of_speech(part_of_speech):
-    if part_of_speech in PART_OF_SPEECH_ABBREVIATION.keys():
-        part_of_speech = PART_OF_SPEECH_ABBREVIATION[part_of_speech]
-
-    return part_of_speech
+    def transfer_to_fields(self, editor):
+        for field_id in self._queue:
+            insert_into_field(editor, self._queue[field_id], field_id)
 
 
 def insert_into_field(editor, text, field_id, overwrite=False):
@@ -422,10 +571,12 @@ def insert_into_field(editor, text, field_id, overwrite=False):
                 "has %d fields. Use a different note type with %d or more fields, or change the index in the "
                 "Add-on configuration." % (text, field_id, len(editor.note.fields), field_id + 1), period=10000)
         return
+
     if overwrite:
         editor.note.fields[field_id] = text
     else:
         editor.note.fields[field_id] += text
+
     editor.loadNote()
 
 
@@ -435,7 +586,7 @@ def clean_html(raw_html):
 
 
 def setup_buttons(buttons, editor):
-    both_button = editor.addButton(icon=os.path.join(os.path.dirname(__file__), "images", "icon16.png"),
+    main_button = editor.addButton(icon=os.path.join(os.path.dirname(__file__), "images", "icon16.png"),
                                    cmd="AD",
                                    func=get_definition,
                                    tip="AutoDefine Word (%s)" %
@@ -444,6 +595,7 @@ def setup_buttons(buttons, editor):
                                    label="",
                                    keys=PRIMARY_SHORTCUT,
                                    disables=False)
+
     define_button = editor.addButton(icon="",
                                      cmd="D",
                                      func=get_definition_force_definition,
@@ -453,6 +605,7 @@ def setup_buttons(buttons, editor):
                                      label="",
                                      keys=DEFINE_ONLY_SHORTCUT,
                                      disables=False)
+
     pronounce_button = editor.addButton(icon="",
                                         cmd="P",
                                         func=get_definition_force_pronunciation,
@@ -463,6 +616,7 @@ def setup_buttons(buttons, editor):
                                         label="",
                                         keys=PRONOUNCE_ONLY_SHORTCUT,
                                         disables=False)
+
     phonetic_transcription_button = editor.addButton(icon="",
                                                      cmd="ə",
                                                      func=get_definition_force_phonetic_transcription,
@@ -474,11 +628,13 @@ def setup_buttons(buttons, editor):
                                                      label="",
                                                      keys=PHONETIC_TRANSCRIPTION_ONLY_SHORTCUT,
                                                      disables=False)
-    buttons.append(both_button)
+    buttons.append(main_button)
+
     if DEDICATED_INDIVIDUAL_BUTTONS:
         buttons.append(define_button)
         buttons.append(pronounce_button)
         buttons.append(phonetic_transcription_button)
+
     return buttons
 
 
